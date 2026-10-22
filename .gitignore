@@ -1,0 +1,10 @@
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+node_modules/
+.env
+.env.*
+!.env.example
+.next/
+contracts/deployments/31337.json
+contracts/lib/
