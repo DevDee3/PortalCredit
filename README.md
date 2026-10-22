@@ -95,3 +95,7 @@ _Pending. Contract addresses, transaction hashes and explorer links will be list
 - [forge-std](https://github.com/foundry-rs/forge-std) (MIT / Apache-2.0): Foundry test and script helpers
 - Development tooling used AI assistance (Claude). All code in this repository was written during the Hacker House
   period.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
