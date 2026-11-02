@@ -17,8 +17,11 @@ import {ReceivableNFT} from "./ReceivableNFT.sol";
 ///   Performing --flagOverdue--> Overdue --dispute--> Disputed --resolve--> Performing (upheld)
 ///                                  |                    |                     or Overdue (rejected/expired)
 ///                                  +--seize (window over)--> Seized --liquidate--> Liquidated | Recovered
-///                                                                                   Liquidated --recover--> Recovered
-///                                                                                   Liquidated --writeOff--> WrittenOff
+///   Liquidated --recover--> Recovered
+///   Liquidated --writeOff--> WrittenOff
+///
+/// The vault books the expected loss the moment a loan becomes Overdue (flagged here, or recognised by the
+/// vault's own stale-loan sync), so the share price never lags a default that is visible on chain.
 ///
 /// Design notes
 ///   - Every transition is permissionless except dispute resolution (the resolver) and early write-off (owner).
@@ -57,12 +60,12 @@ contract DefaultEngine is Ownable, Pausable, ReentrancyGuard, IDefaultEngine {
     IERC20 public immutable stable;
 
     address public resolver;
-    uint64 public gracePeriod = 3 days;
+    uint64 public override gracePeriod = 3 days;
     uint64 public disputeWindow = 3 days;
     uint64 public auctionDuration = 2 days;
     uint64 public resolutionTimeout = 7 days;
     uint64 public recoveryPeriod = 30 days;
-    uint16 public floorBps = 4_000;
+    uint16 public override floorBps = 4_000;
     uint256 public disputeBond;
 
     mapping(uint256 => Case) public cases;
@@ -93,7 +96,7 @@ contract DefaultEngine is Ownable, Pausable, ReentrancyGuard, IDefaultEngine {
     event Liquidated(uint256 indexed tokenId, address indexed buyer, uint256 price, uint256 shortfall);
     event Recovered(uint256 indexed tokenId, address indexed payer, uint256 amount, uint256 shortfallLeft);
     event WrittenOff(uint256 indexed tokenId, uint256 loss);
-    event ResolverSet(address resolver);
+    event ResolverSet(address indexed resolver);
     event ParameterSet(bytes32 indexed key, uint256 value);
 
     modifier onlyVault() {
@@ -212,9 +215,16 @@ contract DefaultEngine is Ownable, Pausable, ReentrancyGuard, IDefaultEngine {
         if (c.status != Status.Performing || !vault.isActive(tokenId)) revert BadStatus();
         if (block.timestamp < uint256(vault.dueDateOf(tokenId)) + gracePeriod) revert NotYet();
 
-        c.disputeDeadline = uint64(block.timestamp) + disputeWindow;
-        _set(tokenId, Status.Overdue, bytes32(0));
-        emit FlaggedOverdue(tokenId, c.disputeDeadline);
+        _flag(tokenId, c);
+        // The vault books the expected loss now, so the share price reflects the default from this moment.
+        vault.markOverdue(tokenId, floorBps);
+    }
+
+    /// @inheritdoc IDefaultEngine
+    function onOverdue(uint256 tokenId) external onlyVault {
+        Case storage c = cases[tokenId];
+        if (c.status != Status.Performing) revert BadStatus();
+        _flag(tokenId, c);
     }
 
     /// @notice The borrower contests the default once, inside the window, posting an optional bond.
@@ -246,8 +256,9 @@ contract DefaultEngine is Ownable, Pausable, ReentrancyGuard, IDefaultEngine {
         c.bond = 0;
         if (upheld) {
             if (newDueDate <= block.timestamp) revert BadDueDate();
-            vault.setDueDate(tokenId, newDueDate);
             _set(tokenId, Status.Performing, "upheld");
+            vault.setDueDate(tokenId, newDueDate);
+            vault.clearImpairment(tokenId);
             if (bond > 0) stable.safeTransfer(vault.borrowerOf(tokenId), bond);
         } else {
             c.disputeDeadline = uint64(block.timestamp);
@@ -288,9 +299,9 @@ contract DefaultEngine is Ownable, Pausable, ReentrancyGuard, IDefaultEngine {
             } catch {}
         }
 
-        vault.seize(tokenId, floorBps);
         c.seizedAt = uint64(block.timestamp);
         _set(tokenId, Status.Seized, bytes32(0));
+        vault.seize(tokenId, floorBps);
         emit Seized(tokenId);
 
         if (r != address(0)) {
@@ -305,11 +316,14 @@ contract DefaultEngine is Ownable, Pausable, ReentrancyGuard, IDefaultEngine {
         uint256 price = currentPrice(tokenId);
         if (price > maxPrice) revert PriceTooHigh(price, maxPrice);
 
+        // engine and vault entry points share nonReentrant locks; the shortfall is only known after this call
+        // slither-disable-next-line reentrancy-no-eth
         uint256 shortfall = vault.applyLiquidation(tokenId, price, msg.sender);
         nft.transferFrom(address(this), msg.sender, tokenId);
 
         c.shortfall = shortfall;
         c.liquidatedAt = uint64(block.timestamp);
+        // slither-disable-next-line incorrect-equality -- exact integer waterfall result, not a balance probe
         _set(tokenId, shortfall == 0 ? Status.Recovered : Status.Liquidated, bytes32(price));
         emit Liquidated(tokenId, msg.sender, price, shortfall);
 
@@ -327,9 +341,9 @@ contract DefaultEngine is Ownable, Pausable, ReentrancyGuard, IDefaultEngine {
         if (amount > c.shortfall) revert ExceedsShortfall();
 
         c.shortfall -= amount;
+        if (c.shortfall == 0) _set(tokenId, Status.Recovered, bytes32("recovered"));
         vault.creditRecovery(msg.sender, amount);
         emit Recovered(tokenId, msg.sender, amount, c.shortfall);
-        if (c.shortfall == 0) _set(tokenId, Status.Recovered, bytes32("recovered"));
     }
 
     /// @notice Accept the remaining shortfall as a loss. Owner at any time, anyone after `recoveryPeriod`.
@@ -343,6 +357,12 @@ contract DefaultEngine is Ownable, Pausable, ReentrancyGuard, IDefaultEngine {
     }
 
     // ------------------------------------------------------------------ internal
+
+    function _flag(uint256 tokenId, Case storage c) internal {
+        c.disputeDeadline = uint64(block.timestamp) + disputeWindow;
+        _set(tokenId, Status.Overdue, bytes32(0));
+        emit FlaggedOverdue(tokenId, c.disputeDeadline);
+    }
 
     function _set(uint256 tokenId, Status status, bytes32 ref) internal {
         cases[tokenId].status = status;

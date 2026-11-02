@@ -21,9 +21,16 @@ import {ReceivableNFT} from "./ReceivableNFT.sol";
 ///   totalAssets = idleCash + outstandingPrincipal - totalImpairment
 ///   - idleCash is tracked internally, so stray token donations cannot move the share price.
 ///   - The yield is an origination fee, owed on top of principal and paid on repayment.
-///   - When the engine seizes collateral the loan is immediately written down to its expected
-///     recovery (the auction floor). LPs therefore see the loss when the default is confirmed, not
-///     only after liquidation. The write-down is reversed and replaced by the real result at liquidation.
+///   - A loan is written down to its expected recovery (the auction floor) the moment it is recognised
+///     as overdue, i.e. when the engine flags it or when the vault's own stale-loan sync does. LPs
+///     therefore see the loss when the default becomes visible on chain, not days later. The write-down
+///     is scaled down on partial repayment, cleared on full repayment or an upheld dispute, and replaced
+///     by the real result at liquidation.
+///   - Timing games are closed on both sides. Before any deposit or withdrawal the vault recognises
+///     loans whose due date plus grace has passed (a min-heap by due date, bounded work per call), and
+///     redemptions are refused while an unrecognised overdue loan remains. Deposits are refused while any
+///     write-down is open, so a late depositor cannot buy shares at a depressed price and then share in
+///     an auction recovery it never carried.
 ///   - Shares use a 6-decimal virtual offset (OpenZeppelin) to defeat first-depositor inflation attacks.
 contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVault {
     using SafeERC20 for IERC20;
@@ -35,6 +42,8 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
     uint16 public constant MAX_ORIGINATION_FEE = 1_000;
     uint16 public constant MAX_PROTOCOL_FEE = 5_000;
     uint16 public constant MAX_RESERVE = 2_000;
+    /// @notice Max queue entries processed by one deposit/withdraw call; `sync` can drain more.
+    uint256 public constant MAX_SYNC_STEPS = 8;
 
     struct Loan {
         address borrower;
@@ -61,6 +70,13 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
 
     mapping(uint256 => Loan) public loans;
 
+    /// @dev Min-heap of (dueDate << 192 | tokenId) holding exactly the loans that are active, not seized
+    ///      and still Performing in the engine. A loan leaves the heap when it is repaid, flagged overdue
+    ///      or seized, and is re-queued with its new due date if a dispute is upheld.
+    uint256[] private _dueHeap;
+    /// @dev tokenId => index in `_dueHeap` plus one (0 means not queued).
+    mapping(uint256 => uint256) private _heapPos;
+
     error ZeroAddress();
     error ZeroAmount();
     error EngineUnset();
@@ -83,11 +99,13 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
     );
     event LoanClosed(uint256 indexed tokenId, address indexed borrower);
     event Seized(uint256 indexed tokenId, uint256 impairment);
+    event Impaired(uint256 indexed tokenId, uint256 impairment);
+    event ImpairmentCleared(uint256 indexed tokenId);
     event LiquidationApplied(uint256 indexed tokenId, address indexed payer, uint256 recovered, uint256 shortfall);
     event RecoveryCredited(address indexed payer, uint256 amount);
     event YieldBooked(uint256 amount);
-    event EngineSet(address engine);
-    event TreasurySet(address treasury);
+    event EngineSet(address indexed engine);
+    event TreasurySet(address indexed treasury);
     event ParameterSet(bytes32 indexed key, uint256 value);
 
     modifier onlyEngine() {
@@ -197,34 +215,79 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
         return 6;
     }
 
+    /// @notice True when a loan is past due + grace but not yet recognised, so the share price is stale.
+    function needsSync() public view returns (bool) {
+        if (_dueHeap.length == 0) return false;
+        return block.timestamp >= (_dueHeap[0] >> 192) + engine.gracePeriod();
+    }
+
+    function dueQueueLength() external view returns (uint256) {
+        return _dueHeap.length;
+    }
+
     function maxDeposit(address) public view override returns (uint256) {
-        return paused() ? 0 : type(uint256).max;
+        return (paused() || totalImpairment > 0 || needsSync()) ? 0 : type(uint256).max;
     }
 
     function maxMint(address) public view override returns (uint256) {
-        return paused() ? 0 : type(uint256).max;
+        return (paused() || totalImpairment > 0 || needsSync()) ? 0 : type(uint256).max;
     }
 
     function maxWithdraw(address owner_) public view override returns (uint256) {
-        if (paused()) return 0;
+        if (paused() || needsSync()) return 0;
         uint256 claim = convertToAssets(balanceOf(owner_));
         uint256 cap = spendableCash();
         return claim < cap ? claim : cap;
     }
 
     function maxRedeem(address owner_) public view override returns (uint256) {
-        if (paused()) return 0;
+        if (paused() || needsSync()) return 0;
         uint256 held = balanceOf(owner_);
         uint256 cap = convertToShares(spendableCash());
         return held < cap ? held : cap;
     }
 
-    function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
-        internal
+    // Every entry point that prices shares first recognises overdue loans, so the price is never stale.
+
+    function deposit(uint256 assets, address receiver) public override nonReentrant whenNotPaused returns (uint256) {
+        _syncOverdue(MAX_SYNC_STEPS);
+        return super.deposit(assets, receiver);
+    }
+
+    function mint(uint256 shares, address receiver) public override nonReentrant whenNotPaused returns (uint256) {
+        _syncOverdue(MAX_SYNC_STEPS);
+        return super.mint(shares, receiver);
+    }
+
+    function withdraw(uint256 assets, address receiver, address owner_)
+        public
         override
         nonReentrant
         whenNotPaused
+        returns (uint256)
     {
+        _syncOverdue(MAX_SYNC_STEPS);
+        return super.withdraw(assets, receiver, owner_);
+    }
+
+    function redeem(uint256 shares, address receiver, address owner_)
+        public
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256)
+    {
+        _syncOverdue(MAX_SYNC_STEPS);
+        return super.redeem(shares, receiver, owner_);
+    }
+
+    /// @notice Permissionless: recognise up to `maxSteps` overdue loans (and discard stale queue entries).
+    function sync(uint256 maxSteps) external nonReentrant whenNotPaused {
+        _syncOverdue(maxSteps);
+    }
+
+    // The public entry points above hold the reentrancy lock and the pause check for the whole call.
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
         if (assets == 0 || shares == 0) revert ZeroAmount();
         super._deposit(caller, receiver, assets, shares);
         idleCash += assets;
@@ -233,8 +296,6 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
     function _withdraw(address caller, address receiver, address owner_, uint256 assets, uint256 shares)
         internal
         override
-        nonReentrant
-        whenNotPaused
     {
         idleCash -= assets;
         super._withdraw(caller, receiver, owner_, assets, shares);
@@ -267,6 +328,7 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
         });
         outstandingPrincipal += principal;
         idleCash -= principal;
+        _heapPush(r.dueDate, tokenId);
 
         nft.transferFrom(msg.sender, address(this), tokenId);
         nft.lock(tokenId);
@@ -303,6 +365,12 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
         loan.feeOwed -= feePaid.toUint128();
         loan.principal -= principalPaid.toUint128();
         outstandingPrincipal -= principalPaid;
+        if (principalPaid > 0 && loan.impairment > 0) {
+            // the write-down follows the principal that is still at risk
+            uint256 scaled = uint256(loan.impairment).mulDiv(loan.principal, uint256(loan.principal) + principalPaid);
+            totalImpairment -= uint256(loan.impairment) - scaled;
+            loan.impairment = scaled.toUint128();
+        }
         idleCash += pull - protocolCut;
 
         IERC20 token = IERC20(asset());
@@ -312,6 +380,7 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
 
         if (loan.principal == 0 && loan.feeOwed == 0) {
             loan.active = false;
+            _heapRemove(tokenId);
             address borrower = loan.borrower;
             nft.unlock(tokenId);
             nft.transferFrom(address(this), borrower, tokenId);
@@ -322,24 +391,41 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
 
     // ------------------------------------------------------------------ engine hooks
 
+    function markOverdue(uint256 tokenId, uint16 floorBps) external onlyEngine {
+        Loan storage loan = loans[tokenId];
+        if (!loan.active || loan.seized) revert NoLoan();
+        if (floorBps > BPS) revert ParamOutOfBounds();
+        _heapRemove(tokenId); // recognised now; no longer waiting to be flagged
+        _impair(loan, tokenId, floorBps);
+    }
+
+    function clearImpairment(uint256 tokenId) external onlyEngine {
+        Loan storage loan = loans[tokenId];
+        if (!loan.active || loan.seized) revert NoLoan();
+        totalImpairment -= loan.impairment;
+        loan.impairment = 0;
+        emit ImpairmentCleared(tokenId);
+    }
+
     function seize(uint256 tokenId, uint16 floorBps) external onlyEngine {
         Loan storage loan = loans[tokenId];
         if (!loan.active || loan.seized) revert NoLoan();
         if (floorBps > BPS) revert ParamOutOfBounds();
 
         loan.seized = true;
-        uint256 impairment = uint256(loan.principal).mulDiv(BPS - floorBps, BPS);
-        loan.impairment = impairment.toUint128();
-        totalImpairment += impairment;
+        _heapRemove(tokenId);
+        _impair(loan, tokenId, floorBps); // normally already booked at flag time; re-sized to the current floor
 
         nft.transferFrom(address(this), msg.sender, tokenId);
-        emit Seized(tokenId, impairment);
+        emit Seized(tokenId, loan.impairment);
     }
 
     function setDueDate(uint256 tokenId, uint64 newDueDate) external onlyEngine {
         Loan storage loan = loans[tokenId];
         if (!loan.active || loan.seized) revert NoLoan();
         loan.dueDate = newDueDate;
+        _heapRemove(tokenId);
+        _heapPush(newDueDate, tokenId);
         nft.updateDueDate(tokenId, newDueDate);
     }
 
@@ -370,6 +456,8 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
         loan.active = false;
 
         IERC20 token = IERC20(asset());
+        // engine-only; `payer` is the engine's own msg.sender, who approved this vault
+        // slither-disable-next-line arbitrary-send-erc20
         token.safeTransferFrom(payer, address(this), recovered);
         if (protocolCut > 0) token.safeTransfer(treasury, protocolCut);
         nft.unlock(tokenId);
@@ -380,6 +468,8 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
     function creditRecovery(address payer, uint256 amount) external nonReentrant onlyEngine {
         if (amount == 0 || payer == address(0)) revert ZeroAmount();
         idleCash += amount;
+        // engine-only; `payer` is the engine's own msg.sender, who approved this vault
+        // slither-disable-next-line arbitrary-send-erc20
         IERC20(asset()).safeTransferFrom(payer, address(this), amount);
         emit RecoveryCredited(payer, amount);
     }
@@ -389,5 +479,85 @@ contract CreditVault is ERC4626, Ownable, Pausable, ReentrancyGuard, ICreditVaul
         if (IERC20(asset()).balanceOf(address(this)) < idleCash + amount) revert UnbackedYield();
         idleCash += amount;
         emit YieldBooked(amount);
+    }
+
+    // ------------------------------------------------------------------ overdue recognition
+
+    /// @dev Sets the loan's write-down to principal * (1 - floor) and keeps `totalImpairment` in step.
+    function _impair(Loan storage loan, uint256 tokenId, uint16 floorBps_) private {
+        uint256 impairment = uint256(loan.principal).mulDiv(BPS - floorBps_, BPS);
+        totalImpairment = totalImpairment - loan.impairment + impairment;
+        loan.impairment = impairment.toUint128();
+        emit Impaired(tokenId, impairment);
+    }
+
+    /// @dev Recognises loans whose due date + grace has passed, oldest first. Bounded by `maxSteps`.
+    // the engine is a trusted, owner-wired contract, entry points hold the lock, work is bounded by maxSteps
+    // slither-disable-next-line reentrancy-no-eth,reentrancy-events,calls-loop
+    function _syncOverdue(uint256 maxSteps) private {
+        if (_dueHeap.length == 0) return;
+        uint256 grace = engine.gracePeriod();
+        for (uint256 i; i < maxSteps && _dueHeap.length > 0; ++i) {
+            uint256 top = _dueHeap[0];
+            if (block.timestamp < (top >> 192) + grace) break;
+
+            uint256 tokenId = top & type(uint192).max;
+            _heapRemove(tokenId);
+            _impair(loans[tokenId], tokenId, engine.floorBps());
+            engine.onOverdue(tokenId);
+        }
+    }
+
+    function _heapPush(uint64 due, uint256 tokenId) private {
+        // token ids are sequential and far below 2**192, so they fit under the due date in the packed key
+        _dueHeap.push((uint256(due) << 192) | tokenId);
+        _siftUp(_dueHeap.length - 1);
+    }
+
+    /// @dev No-op when the loan is not queued (already flagged, seized or closed).
+    function _heapRemove(uint256 tokenId) private {
+        uint256 pos = _heapPos[tokenId];
+        if (pos == 0) return;
+        uint256 i = pos - 1;
+        uint256 lastIndex = _dueHeap.length - 1;
+        uint256 last = _dueHeap[lastIndex];
+        _dueHeap.pop();
+        delete _heapPos[tokenId];
+        if (i == lastIndex) return;
+        _dueHeap[i] = last;
+        _heapPos[last & type(uint192).max] = i + 1;
+        _siftDown(i);
+        _siftUp(i);
+    }
+
+    function _siftUp(uint256 i) private {
+        uint256 key = _dueHeap[i];
+        while (i > 0) {
+            uint256 parent = (i - 1) / 2;
+            uint256 parentKey = _dueHeap[parent];
+            if (parentKey <= key) break;
+            _dueHeap[i] = parentKey;
+            _heapPos[parentKey & type(uint192).max] = i + 1;
+            i = parent;
+        }
+        _dueHeap[i] = key;
+        _heapPos[key & type(uint192).max] = i + 1;
+    }
+
+    function _siftDown(uint256 i) private {
+        uint256 n = _dueHeap.length;
+        uint256 key = _dueHeap[i];
+        while (true) {
+            uint256 child = 2 * i + 1;
+            if (child >= n) break;
+            if (child + 1 < n && _dueHeap[child + 1] < _dueHeap[child]) ++child;
+            uint256 childKey = _dueHeap[child];
+            if (childKey >= key) break;
+            _dueHeap[i] = childKey;
+            _heapPos[childKey & type(uint192).max] = i + 1;
+            i = child;
+        }
+        _dueHeap[i] = key;
+        _heapPos[key & type(uint192).max] = i + 1;
     }
 }

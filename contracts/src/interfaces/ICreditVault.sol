@@ -8,6 +8,12 @@ interface ICreditVault {
     function borrowerOf(uint256 tokenId) external view returns (address);
     function debtOf(uint256 tokenId) external view returns (uint256);
 
+    /// @notice Books the expected loss on a loan the engine has just flagged overdue (write-down to the auction floor).
+    function markOverdue(uint256 tokenId, uint16 floorBps) external;
+
+    /// @notice Reverses the write-down when a dispute is upheld and the loan performs again.
+    function clearImpairment(uint256 tokenId) external;
+
     /// @notice Moves collateral to the engine and marks the loan impaired at the auction floor.
     function seize(uint256 tokenId, uint16 floorBps) external;
 

@@ -7,6 +7,7 @@ import {MockStable} from "../src/MockStable.sol";
 import {ReceivableNFT} from "../src/ReceivableNFT.sol";
 import {CreditVault} from "../src/CreditVault.sol";
 import {DefaultEngine} from "../src/DefaultEngine.sol";
+import {ArbiterResolver} from "../src/ArbiterResolver.sol";
 import {IDefaultEngine} from "../src/interfaces/IDefaultEngine.sol";
 
 /// @dev Randomly drives the whole protocol: deposits, withdrawals, originations, repayments, time travel,
@@ -16,6 +17,8 @@ contract Handler is Test {
     ReceivableNFT internal nft;
     CreditVault internal vault;
     DefaultEngine internal engine;
+    ArbiterResolver internal arbiter;
+    address internal arbiterOwner;
     address internal lp;
     address internal borrower;
     address internal buyer;
@@ -27,10 +30,14 @@ contract Handler is Test {
         ReceivableNFT nft_,
         CreditVault vault_,
         DefaultEngine engine_,
+        ArbiterResolver arbiter_,
+        address arbiterOwner_,
         address lp_,
         address borrower_,
         address buyer_
     ) {
+        arbiter = arbiter_;
+        arbiterOwner = arbiterOwner_;
         stable = stable_;
         nft = nft_;
         vault = vault_;
@@ -100,6 +107,22 @@ contract Handler is Test {
         try engine.liquidate(_pick(idSeed), type(uint256).max) {} catch {}
     }
 
+    function syncQueue(uint256 steps) external {
+        try vault.sync(bound(steps, 1, 20)) {} catch {}
+    }
+
+    function dispute(uint256 idSeed) external {
+        if (ids.length == 0) return;
+        vm.prank(borrower);
+        try engine.dispute(_pick(idSeed), keccak256("evidence")) {} catch {}
+    }
+
+    function rule(uint256 idSeed, bool upheld) external {
+        if (ids.length == 0) return;
+        vm.prank(arbiterOwner);
+        try arbiter.resolve(_pick(idSeed), upheld, uint64(block.timestamp + 5 days)) {} catch {}
+    }
+
     function recover(uint256 idSeed, uint256 amount) external {
         if (ids.length == 0) return;
         vm.prank(buyer);
@@ -120,7 +143,7 @@ contract InvariantTest is Base {
         vm.prank(lp);
         stable.approve(address(vault), type(uint256).max);
 
-        handler = new Handler(stable, nft, vault, engine, lp, borrower, buyer);
+        handler = new Handler(stable, nft, vault, engine, arbiter, address(this), lp, borrower, buyer);
         targetContract(address(handler));
     }
 
@@ -163,6 +186,48 @@ contract InvariantTest is Base {
             if (active && !seized) assertEq(nft.ownerOf(id), address(vault));
             if (active && seized) assertEq(nft.ownerOf(id), address(engine));
             if (active) assertTrue(nft.locked(id));
+        }
+    }
+
+    /// @dev The overdue queue holds exactly the loans that are active, unseized and still Performing.
+    function invariant_queueMatchesPerformingLoans() public view {
+        uint256 performing;
+        uint256 n = handler.idCount();
+        for (uint256 i; i < n; ++i) {
+            uint256 id = handler.ids(i);
+            (, bool active, bool seized,,,,) = vault.loans(id);
+            if (active && !seized && engine.statusOf(id) == IDefaultEngine.Status.Performing) performing++;
+        }
+        assertEq(vault.dueQueueLength(), performing);
+    }
+
+    /// @dev A loan is written down exactly when the engine no longer treats it as performing.
+    function invariant_writeDownFollowsStatus() public view {
+        uint256 n = handler.idCount();
+        for (uint256 i; i < n; ++i) {
+            uint256 id = handler.ids(i);
+            (, bool active,,, uint128 principal,, uint128 impairment) = vault.loans(id);
+            if (!active) {
+                assertEq(impairment, 0);
+                continue;
+            }
+            IDefaultEngine.Status st = engine.statusOf(id);
+            if (st == IDefaultEngine.Status.Performing) assertEq(impairment, 0);
+            else if (principal > 0) assertGt(impairment, 0);
+        }
+    }
+
+    /// @dev The core fairness property: whenever redemptions are open, no loan is past due + grace
+    ///      while still unrecognised, so an exit can never be priced before a visible default.
+    function invariant_exitsOnlyAtRecognisedPrice() public view {
+        if (vault.maxRedeem(lp) == 0) return;
+        uint256 n = handler.idCount();
+        for (uint256 i; i < n; ++i) {
+            uint256 id = handler.ids(i);
+            (, bool active, bool seized, uint64 dueDate,,,) = vault.loans(id);
+            if (active && !seized && engine.statusOf(id) == IDefaultEngine.Status.Performing) {
+                assertLt(block.timestamp, uint256(dueDate) + engine.gracePeriod());
+            }
         }
     }
 }

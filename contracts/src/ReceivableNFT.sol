@@ -32,7 +32,7 @@ contract ReceivableNFT is ERC721, Ownable {
     event ReceivableMinted(
         uint256 indexed tokenId, address indexed originator, uint256 faceValue, uint64 dueDate, bytes32 obligor
     );
-    event WiringSet(address vault, address engine);
+    event WiringSet(address indexed vault, address indexed engine);
     event Locked(uint256 indexed tokenId);
     event Unlocked(uint256 indexed tokenId);
     event DueDateUpdated(uint256 indexed tokenId, uint64 dueDate);

@@ -73,6 +73,16 @@ node --experimental-strip-types scripts/e2e.mts   # full advance/repay/default/l
 
 Testnet deployment steps are in [docs/chain-notes.md](docs/chain-notes.md).
 
+To deploy the contracts to Portaldot V3 Testnet from `contracts/`, use either a
+private key or an encrypted Foundry keystore account. For a keystore account,
+provide the account's public address in `DEPLOYER`:
+
+```bash
+DEPLOYER=<deployer address> forge script script/Deploy.s.sol \
+  --account <account name> \
+  --rpc-url portaldot_testnet --chain-id 420420777 --broadcast
+```
+
 ## Status
 
 | Item | State |

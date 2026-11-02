@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {Base} from "./Base.t.sol";
 import {CreditVault} from "../src/CreditVault.sol";
 import {DefaultEngine} from "../src/DefaultEngine.sol";
@@ -201,7 +202,7 @@ contract VaultTest is Base {
         assertEq(vault.maxWithdraw(lp), 0);
 
         vm.prank(lp);
-        vm.expectPartialRevert(ERC4626.ERC4626ExceededMaxDeposit.selector);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
         vault.deposit(1e6, lp);
 
         vm.startPrank(borrower);

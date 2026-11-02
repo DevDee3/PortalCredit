@@ -1,6 +1,15 @@
 # Portaldot chain notes
 
-Honest status of what we know about running this on Portaldot V3. Update this file as the facts are confirmed.
+Network details for Portaldot V3 Testnet and the current deployment runbook.
+
+## Testnet network
+
+| Item | Value |
+|---|---|
+| EVM RPC | `https://test-evm-rpc-v3.portaldot.dev` |
+| WebSocket node | `wss://test-node-v3.portaldot.dev` |
+| EVM chain ID | `420420777` |
+| Node explorer | https://node-console.portaldot.dev/ |
 
 ## Verified
 
@@ -14,7 +23,7 @@ Honest status of what we know about running this on Portaldot V3. Update this fi
 | Question | Why it matters | How to confirm |
 |---|---|---|
 | Does standard solc EVM bytecode deploy on the V3 testnet? | Public notes describe the Solidity side as `pallet-revive`, which may require a different compiler target (resolc / PolkaVM) instead of plain EVM bytecode. | Deploy a trivial contract with `forge create`. If rejected, use the toolchain the Portaldot V3 repos/Discord point to and report the finding. |
-| Testnet RPC URL, chain ID, explorer | Needed for `foundry.toml` and the frontend. A candidate RPC URL circulated but was not reachable from our build sandbox, so it is unconfirmed. | Official Discord (`discord.gg/portaldot`) and the V3 GitHub repos. |
+| Testnet RPC URL, chain ID, explorer | Required for deployment and frontend configuration. | Confirmed from the updated Portaldot V3 testnet network information above. |
 | How to fund an EVM address | Reports say an EVM address must be funded via its mapped Substrate address. | Official guide and faucet in Discord. |
 | Contract size and opcode limits | The vault and engine are medium-sized; limits could force splitting. | Deploy and observe. |
 | Does an official DaaS interface exist on testnet? | Would let `IDefaultResolver` adapt to it. None was publicly documented. | Ask in Discord / kickoff notes. |
@@ -28,14 +37,13 @@ Run from a machine that can reach the testnet RPC.
 # 1. install Foundry (https://getfoundry.sh) and clone the repo
 cd contracts
 
-# 2. configure
-export RPC_URL=<portaldot testnet rpc>
-export PRIVATE_KEY=<funded deployer key>      # never commit this
+# 2. configure (use --account with an encrypted keystore, or PRIVATE_KEY)
+export DEPLOYER=<deployer address>             # public address used with --account
 export SEED_LIQUIDITY=10000000000              # optional: 10,000 pcUSD as first LP
-export DEMO_WINDOWS=true                       # minutes-long windows so the lifecycle can be shown live
+export DEMO_WINDOWS=true                      # minutes-long windows so the lifecycle can be shown live
 
 # 3. sanity check with a trivial deployment first, then deploy the system
-forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
+forge script script/Deploy.s.sol --account <account name> --rpc-url portaldot_testnet --chain-id 420420777 --broadcast
 
 # 4. addresses are written to deployments/<chainid>.json; commit that file and paste the tx hashes into the README
 ```
